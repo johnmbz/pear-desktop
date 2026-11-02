@@ -2,25 +2,50 @@ import * as z from 'zod';
 
 import { LRC } from '../parsers/lrc';
 import { netFetch } from '../renderer';
+import { config } from '../renderer/renderer';
 
 import type { LyricProvider, LyricResult, SearchSongInfo } from '../types';
+
+const HONEYPOT_SNIPPETS = ['wob gopini den', 'tefe woxica fero'];
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+const isHoneypotLyrics = (raw: string | undefined): boolean => {
+  if (!raw) return false;
+  const normalized = raw
+    .replace(/\[\d+:\d+(?:\.\d+)?\]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  return HONEYPOT_SNIPPETS.some((snippet) => normalized.includes(snippet));
+};
 
 export class MusixMatch implements LyricProvider {
   name = 'MusixMatch';
   baseUrl = 'https://www.musixmatch.com/';
 
-  private api: MusixMatchAPI | undefined;
+  private apiPromise: Promise<MusixMatchAPI> | undefined;
+
+  private getApi(): Promise<MusixMatchAPI> {
+    this.apiPromise ??= MusixMatchAPI.new().catch((error: unknown) => {
+      this.apiPromise = undefined;
+      throw error;
+    });
+    return this.apiPromise;
+  }
 
   async search(info: SearchSongInfo): Promise<LyricResult | null> {
     // late-init the API, to avoid an electron IPC issue
     // an added benefit is that if it has an error during init, the user can hit the retry button
-    this.api ??= await MusixMatchAPI.new();
-    await this.api.reinit();
+    const api = await this.getApi();
+    await api.reinit();
 
-    const data = await this.api.query(Endpoint.getMacroSubtitles, {
+    const data = await api.query(Endpoint.getMacroSubtitles, {
       q_track: info.alternativeTitle || info.title,
       q_artist: info.artist,
-      q_duration: info.songDuration.toString(),
       ...(info.album ? { q_album: info.album } : {}),
       namespace: 'lyrics_richsynched',
       subtitle_format: 'lrc',
@@ -38,16 +63,32 @@ export class MusixMatch implements LyricProvider {
     // either no track found, or musixmatch's algorithm returned "Coldplay - Paradise" for no reason whatsoever
     if (!track || track.track_id === 115264642) return null;
 
+    if (
+      !config()?.showLyricsEvenIfInexact &&
+      track.track_length !== undefined &&
+      Math.abs(track.track_length - info.songDuration) > 15
+    ) {
+      return null;
+    }
+
+    const subtitleBody = subtitle?.subtitle.subtitle_body;
+    const validSubtitle = isHoneypotLyrics(subtitleBody)
+      ? undefined
+      : subtitleBody;
+    const validLyrics = isHoneypotLyrics(lyrics) ? undefined : lyrics;
+
+    if (!validSubtitle && !validLyrics) return null;
+
     return {
       title: track.track_name,
       artists: [track.artist_name],
-      lines: subtitle
-        ? LRC.parse(subtitle.subtitle.subtitle_body).lines.map((l) => ({
+      lines: validSubtitle
+        ? LRC.parse(validSubtitle).lines.map((l) => ({
             ...l,
             status: 'upcoming' as const,
           }))
         : undefined,
-      lyrics: lyrics,
+      lyrics: validLyrics,
     };
   }
 }
@@ -59,19 +100,20 @@ const Track = z.object({
   track_id: z.number(),
   track_name: z.string(),
   artist_name: z.string(),
+  track_length: z.number().optional(),
 });
 
 const Lyrics = z.object({
-  instrumental: zBoolean,
+  instrumental: zBoolean.optional(),
   lyrics_body: z.string(),
-  lyrics_language: z.string(),
-  lyrics_language_description: z.string(),
+  lyrics_language: z.string().optional(),
+  lyrics_language_description: z.string().optional(),
 });
 
 const Subtitle = z.object({
   subtitle_body: z.string(),
-  subtitle_length: z.number(),
-  subtitle_language: z.string(),
+  subtitle_length: z.number().optional(),
+  subtitle_language: z.string().optional(),
 });
 
 enum Endpoint {
@@ -157,8 +199,9 @@ const ResponseSchema = {
 
 class MusixMatchAPI {
   private initPromise: Promise<void>;
-  private cookie = 'x-mxm-user-id=';
   private token: string | null = null;
+  private requestQueue: Promise<unknown> = Promise.resolve();
+  private lastRequestAt = 0;
 
   private constructor() {
     this.initPromise = this.init();
@@ -170,10 +213,47 @@ class MusixMatchAPI {
     return api;
   }
 
-  public async reinit() {
+  private isValidToken(token: string | null | undefined): token is string {
+    return Boolean(token && token.length > 8 && !/^(.)\1+$/.test(token));
+  }
+
+  private throttledFetch(url: string) {
+    const run = async () => {
+      const elapsed = Date.now() - this.lastRequestAt;
+      if (elapsed < 900) {
+        await sleep(900 - elapsed);
+      }
+      this.lastRequestAt = Date.now();
+      return netFetch(url, {
+        credentials: 'omit',
+        headers: this.headers,
+      });
+    };
+
+    const next = this.requestQueue.then(run, run);
+    this.requestQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  public async reinit(force = false) {
     const [{ status }] = await Promise.allSettled([this.initPromise]);
-    if (status === 'rejected') {
-      this.cookie = 'x-mxm-user-id=';
+    let expired: boolean;
+    try {
+      const saved = this.savedTokenSchema.parse(
+        JSON.parse(localStorage.getItem(this.key) ?? '{ "token": null }'),
+      );
+      expired =
+        !this.isValidToken(saved.token) ||
+        !saved.expires ||
+        saved.expires <= Date.now();
+    } catch {
+      expired = true;
+    }
+
+    if (force || status === 'rejected' || expired) {
       localStorage.removeItem(this.key);
       this.initPromise = this.init();
       await this.initPromise;
@@ -189,7 +269,7 @@ class MusixMatchAPI {
         ? z.infer<(typeof ResponseSchema)[T]>
         : unknown;
     },
-  >(endpoint: T, params: Params[T]): Promise<R> {
+  >(endpoint: T, params: Params[T], retried = false): Promise<R> {
     await this.initPromise;
     if (!this.token) throw new Error('Token not initialized');
 
@@ -202,22 +282,13 @@ class MusixMatchAPI {
           format: 'json',
           usertoken: this.token,
         },
-        <Record<string, string>>params,
+        params as Record<string, string>,
       ),
     );
 
-    const [, json, headers] = await netFetch(`${url}?${clonedParams}`, {
-      headers: { Cookie: this.cookie },
-    });
+    const [, json] = await this.throttledFetch(`${url}?${clonedParams}`);
 
-    const setCookie = Object.entries(headers).find(
-      ([key]) => key.toLowerCase() === 'set-cookie',
-    );
-    if (setCookie) {
-      this.cookie = setCookie[1];
-    }
-
-    const response = JSON.parse(json);
+    const response: unknown = JSON.parse(json);
     // prettier-ignore
     if (
       response && typeof response === 'object' &&
@@ -226,8 +297,21 @@ class MusixMatchAPI {
       'status_code' in response.message.header && typeof response.message.header.status_code === 'number' &&
       response.message.header.status_code === 401
     ) {
-      await this.reinit();
-      return this.query(endpoint, params);
+      if (retried) {
+        throw new Error('MusixMatch API unauthorized (401)');
+      }
+      const hint =
+        'hint' in response.message.header &&
+        typeof response.message.header.hint === 'string'
+          ? response.message.header.hint
+          : '';
+      if (hint === 'captcha') {
+        await sleep(1500);
+        return this.query(endpoint, params, true);
+      }
+      await sleep(1000);
+      await this.reinit(true);
+      return this.query(endpoint, params, true);
     }
 
     const parsed = z
@@ -255,24 +339,33 @@ class MusixMatchAPI {
     }),
   ]);
 
-  private key = 'ytm:synced-lyrics:mxm:token';
+  private key = 'ytm:synced-lyrics:mxm:mobile-token';
   private async init() {
-    const { token, expires } = this.savedTokenSchema.parse(
-      JSON.parse(localStorage.getItem(this.key) ?? '{ "token": null }'),
-    );
-    if (token && expires > Date.now()) {
-      this.token = token;
-      return;
+    localStorage.removeItem('ytm:synced-lyrics:mxm:token');
+
+    try {
+      const { token, expires } = this.savedTokenSchema.parse(
+        JSON.parse(localStorage.getItem(this.key) ?? '{ "token": null }'),
+      );
+      if (this.isValidToken(token) && expires && expires > Date.now()) {
+        this.token = token;
+        return;
+      }
+    } catch {
+      // Ignore malformed cached entry
     }
 
     localStorage.removeItem(this.key);
 
     this.token = await this.getToken();
-    if (!this.token) throw new Error('Failed to get token');
+    if (!this.isValidToken(this.token)) throw new Error('Failed to get token');
 
     localStorage.setItem(
       this.key,
-      JSON.stringify({ token: this.token, expires: Date.now() + (60 * 1000) }),
+      JSON.stringify({
+        token: this.token,
+        expires: Date.now() + 21_600_000,
+      }),
     );
   }
 
@@ -282,25 +375,16 @@ class MusixMatchAPI {
         .object({
           user_token: z.string(),
         })
+        .or(z.instanceof(Array).transform(() => undefined))
         .optional(),
     }),
   });
   private async getToken() {
     const endpoint = 'token.get';
     const params = new URLSearchParams({ app_id: this.app_id });
-    const [, json, headers] = await netFetch(
+    const [, json] = await this.throttledFetch(
       `${this.baseUrl}${endpoint}?${params}`,
-      {
-        headers: Object.assign({ Cookie: this.cookie }, this.headers),
-      },
     );
-
-    const setCookie = Object.entries(headers).find(
-      ([key]) => key.toLowerCase() === 'set-cookie',
-    );
-    if (setCookie) {
-      this.cookie = setCookie[1];
-    }
 
     const {
       message: { body },
@@ -308,9 +392,14 @@ class MusixMatchAPI {
     return body?.user_token ?? '';
   }
 
-  private readonly baseUrl = 'https://apic-desktop.musixmatch.com/ws/1.1/';
-  private readonly app_id = 'web-desktop-app-v1.0';
+  private readonly baseUrl = 'https://apic-appmobile.musixmatch.com/ws/1.1/';
+  private readonly app_id = 'mac-ios-v2.0';
   private readonly headers = {
-    Authority: 'apic-desktop.musixmatch.com',
-  };
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Authority': 'apic-appmobile.musixmatch.com',
+    'X-Cookie': 'x-mxm-token-guid=',
+    'X-User-Agent': 'Musixmatch/2025120901 CFNetwork/3860.300.31 Darwin/25.2.0',
+    'x-mxm-app-version': '10.1.1',
+  } as const;
 }
